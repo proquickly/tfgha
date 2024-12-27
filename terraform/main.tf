@@ -1,63 +1,90 @@
 provider "aws" {
-  region = "us-west-2"
+  region = var.aws_region
 }
 
- resource "aws_key_pair" "deployer" {
-   key_name   = "deployer-key" # Set this to any descriptive name you prefer
-   public_key = file("id_rsa.pub")  # Path to your public key file
- }
+variable "aws_region" {
+  description = "The AWS region to deploy resources in"
+  type        = string
+  default     = "us-west-2"
+}
 
-   resource "aws_security_group" "allow_ssh" {
-     name        = "allow_ssh"
-     description = "Allow SSH inbound traffic"
+variable "public_key_path" {
+  description = "Path to the public key file"
+  type        = string
+  default     = "id_rsa.pub"
+}
 
-     ingress {
-       from_port   = 22
-       to_port     = 22
-       protocol    = "tcp"
-       cidr_blocks = ["0.0.0.0/0"]  # Be cautious with this setting; restrict to specific IPs if possible
-     }
+data "aws_security_groups" "all" {
+  filter {
+    name   = "group-name"
+    values = ["*"]
+  }
+}
 
-     egress {
-       from_port   = 0
-       to_port     = 0
-       protocol    = "-1"
-       cidr_blocks = ["0.0.0.0/0"]
-     }
-   }
-
-resource "aws_instance" "py_server" {
-  ami           = "ami-06946f6c9b153d494"
-  instance_type = "t2.micro"
-  key_name = aws_key_pair.deployer.key_name
-  user_data = <<-EOF
-              #!/bin/bash
-              sudo apt-get update
-              sudo apt-get install -y python3 python3-pip git curl
-              python3 -m venv /home/ubuntu/sys
-              python3 -m pip install -U poetry
-
-              cd /home/ubuntu
-              git clone https://github.com/proquickly/tfgha.git
-              cd /home/ubuntu/tfgha
-
-              /usr/local/bin/poetry lock
-              /usr/local/bin/poetry install
-              cd /home/ubuntu/tfgha/src/tfgha
-
-              nohup poetry run python app.py &
-              EOF
-
-  tags = {
-    Name = "FlaskAppInstance"
+resource "null_resource" "cleanup_security_groups" {
+  triggers = {
+    always_run = timestamp()
   }
 
-  vpc_security_group_ids = [aws_security_group.allow_http.id,
-    aws_security_group.allow_ssh.id]
+  provisioner "local-exec" {
+    command = <<EOF
+      for sg in $(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=*" \
+        --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+        --output text); do
+
+        # Check if SG is attached to running instances
+        INSTANCES=$(aws ec2 describe-instances \
+          --filters "Name=instance.group-id,Values=$sg" \
+          --query 'Reservations[].Instances[?State.Name==`running`].InstanceId' \
+          --output text)
+
+        if [ -z "$INSTANCES" ]; then
+          echo "Deleting security group: $sg"
+          aws ec2 delete-security-group --group-id $sg || true
+        else
+          echo "Security group $sg is attached to running instances, skipping"
+        fi
+      done
+    EOF
+  }
+}
+
+# Add random suffix to avoid conflicts
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "aws_key_pair" "deployer" {
+  key_name   = "deployer-key-${random_id.suffix.hex}"
+  public_key = file(var.public_key_path)
+}
+
+resource "aws_security_group" "allow_ssh" {
+  name        = "allow_ssh_${random_id.suffix.hex}"
+  description = "Allow SSH inbound traffic"
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_security_group" "allow_http" {
-  name        = "allow_http_flask_web_app"
+  name        = "allow_http_flask_${random_id.suffix.hex}"
   description = "Allow inbound HTTP traffic"
 
   ingress {
@@ -73,4 +100,24 @@ resource "aws_security_group" "allow_http" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_instance" "py_server" {
+  ami           = "ami-06946f6c9b153d494"
+  instance_type = "t2.micro"
+  key_name      = aws_key_pair.deployer.key_name
+
+  user_data = file("setup.sh")
+
+  tags = {
+    Name = "FlaskAppInstance"
+  }
+
+  vpc_security_group_ids = [
+    aws_security_group.allow_http.id, aws_security_group.allow_ssh.id
+  ]
 }
