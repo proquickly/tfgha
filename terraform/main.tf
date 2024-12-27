@@ -21,32 +21,12 @@ data "aws_security_groups" "all" {
   }
 }
 
-resource "null_resource" "cleanup_security_groups" {
-  triggers = {
-    always_run = timestamp()
-  }
+resource "aws_security_group" "cleanup_security_groups" {
+  name        = "cleanup_security_groups_${random_id.suffix.hex}"
+  description = "Security group for cleanup purposes"
 
-  provisioner "local-exec" {
-    command = <<EOF
-      for sg in $(aws ec2 describe-security-groups \
-        --filters "Name=group-name,Values=*" \
-        --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
-        --output text); do
-
-        # Check if SG is attached to running instances
-        INSTANCES=$(aws ec2 describe-instances \
-          --filters "Name=instance.group-id,Values=$sg" \
-          --query 'Reservations[].Instances[?State.Name==`running`].InstanceId' \
-          --output text)
-
-        if [ -z "$INSTANCES" ]; then
-          echo "Deleting security group: $sg"
-          aws ec2 delete-security-group --group-id $sg || true
-        else
-          echo "Security group $sg is attached to running instances, skipping"
-        fi
-      done
-    EOF
+  lifecycle {
+    prevent_destroy = false
   }
 }
 
